@@ -23,6 +23,7 @@ import warnings
 import argparse
 import random
 import hashlib
+from collections import OrderedDict
 
 # Add the causal_experiments directory to the path for local imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -59,6 +60,20 @@ DEFAULT_CONFIG = {
     'random_seed_base': 42
 }
 
+# Preferred order for result columns
+PREFERRED_ORDER = [
+    'algorithm', 'train_size', 'repetition', 'seed', 'categorical', 'column_order_strategy', 'column_order'
+]
+
+# Helper to build result row in correct order
+def build_result_row(base_info, metrics, preferred_order, metric_cols):
+    row = OrderedDict()
+    for k in preferred_order:
+        row[k] = base_info.get(k, '')
+    for k in metric_cols:
+        row[k] = metrics.get(k, '')
+    return row
+
 # Utility: Evaluate metrics
 
 def evaluate_metrics(X_test, X_synth, col_names, categorical_cols, k_for_kmarginal=2):
@@ -88,7 +103,7 @@ def run_vanilla_tabpfn(X_train, X_test, col_names, categorical_cols, column_orde
         model.set_categorical_features(categorical_cols_reordered)
     model.fit(torch.from_numpy(X_train_reordered).float())
     X_synth = generate_synthetic_data_quiet(
-        model, config['test_size'], None, config['n_permutations']
+        model, config['test_size'], n_permutations=config['n_permutations']
     )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -100,20 +115,20 @@ def run_vanilla_tabpfn(X_train, X_test, col_names, categorical_cols, column_orde
         'categorical': config['include_categorical'],
         'column_order_strategy': order_strategy,
         'column_order': str(column_order),
-        'graph_type': 'vanilla',
-        'graph_structure': '',
+        'algorithm': 'vanilla',
     }
-    def flatten_metrics():
-        flat = {}
-        for metric in config['metrics']:
-            value = metrics.get(metric)
-            if isinstance(value, dict):
-                for submetric, subvalue in value.items():
-                    flat[f'{metric}_{submetric}'] = subvalue
-            else:
-                flat[metric] = value
-        return flat
-    return {**base_info, **flatten_metrics()}
+    # Flatten metrics
+    flat_metrics = {}
+    for metric in config['metrics']:
+        value = metrics.get(metric)
+        if isinstance(value, dict):
+            for submetric, subvalue in value.items():
+                flat_metrics[f'{metric}_{submetric}'] = subvalue
+        else:
+            flat_metrics[metric] = value
+    metric_cols = list(flat_metrics.keys())
+    result_row = build_result_row(base_info, flat_metrics, PREFERRED_ORDER, metric_cols)
+    return result_row
 
 # Main configuration orchestrator
 
@@ -123,7 +138,7 @@ def hash_array(arr):
     return hashlib.md5(arr.tobytes()).hexdigest()
 
 def run_single_configuration(train_size, order_strategy, repetition, config, 
-                           X_test, correct_dag, col_names, categorical_cols, pre_calculated_column_order,
+                           X_test, correct_dag, col_names, categorical_cols, vanilla_column_order,
                            data_samples_dir=None, hash_check_dict=None):
     print(f"    Order: {order_strategy}, Rep: {repetition+1}/{config['n_repetitions']}")
     seed = config['random_seed_base'] + repetition
@@ -151,11 +166,11 @@ def run_single_configuration(train_size, order_strategy, repetition, config,
                 raise RuntimeError(f"[HASH ERROR] Train/Test data hash mismatch for train_size={train_size}, repetition={repetition}!\nPrev train hash: {prev_train_hash}\nCurrent train hash: {train_hash}\nPrev test hash: {prev_test_hash}\nCurrent test hash: {test_hash}")
         else:
             hash_check_dict[key] = (train_hash, test_hash)
-    result = run_vanilla_tabpfn(X_train_original, X_test, col_names, categorical_cols, pre_calculated_column_order, order_strategy, config, seed, train_size, repetition)
+    result = run_vanilla_tabpfn(X_train_original, X_test, col_names, categorical_cols, vanilla_column_order, order_strategy, config, seed, train_size, repetition)
     # Save data samples if requested
     if SAVE_DATA_SAMPLES and data_samples_dir:
-        X_train_reordered, col_names_reordered, _ = reorder_data_and_columns(X_train_original, col_names, categorical_cols, pre_calculated_column_order)
-        X_test_reordered, _, _ = reorder_data_and_columns(X_test, col_names, categorical_cols, pre_calculated_column_order)
+        X_train_reordered, col_names_reordered, _ = reorder_data_and_columns(X_train_original, col_names, categorical_cols, vanilla_column_order)
+        X_test_reordered, _, _ = reorder_data_and_columns(X_test, col_names, categorical_cols, vanilla_column_order)
         file_prefix = f"order_{order_strategy}_size{train_size}_rep{repetition}"
         pd.DataFrame(X_train_reordered, columns=col_names_reordered).head(10).to_csv(data_samples_dir / f"{file_prefix}_train.csv", index=False)
         pd.DataFrame(X_test_reordered, columns=col_names_reordered).head(10).to_csv(data_samples_dir / f"{file_prefix}_test.csv", index=False)
@@ -167,7 +182,7 @@ def run_single_configuration(train_size, order_strategy, repetition, config,
         if categorical_cols:
             model.set_categorical_features(categorical_cols)
         model.fit(torch.from_numpy(X_train_reordered).float())
-        X_synth = generate_synthetic_data_quiet(model, config['test_size'], None, config['n_permutations'])
+        X_synth = generate_synthetic_data_quiet(model, config['test_size'], n_permutations=config['n_permutations'])
         pd.DataFrame(X_synth, columns=col_names_reordered).head(10).to_csv(data_samples_dir / f"{file_prefix}_synth.csv", index=False)
     return result
 
@@ -205,9 +220,13 @@ def run_experiment_2(config=None, output_dir="experiment_2_results", resume=True
     print(f"Total iterations: {total_iterations}, Already completed: {completed}")
     hash_check_dict = {}
     try:
-        for train_idx, train_size in enumerate(config['train_sizes'][start_train_idx:], start_train_idx):
-            for rep in range(start_rep if train_idx == start_train_idx else 0, config['n_repetitions']):
+        config_idx = 0
+        for train_idx, train_size in enumerate(config['train_sizes']):
+            for rep in range(config['n_repetitions']):
                 for order_strategy in config['ordering_strategies']:
+                    if config_idx < completed:
+                        config_idx += 1
+                        continue
                     result = run_single_configuration(
                         train_size, order_strategy, rep, config, X_test_original,
                         correct_dag, col_names, categorical_cols, pre_calculated_orders[order_strategy],
@@ -219,9 +238,9 @@ def run_experiment_2(config=None, output_dir="experiment_2_results", resume=True
                     df_current.to_csv(output_dir / "raw_results.csv", index=False)
                     save_checkpoint(results_so_far, train_idx, rep + 1, output_dir)
                     completed += 1
+                    config_idx += 1
                     print(f"    Progress: {completed}/{total_iterations} ({100*completed/total_iterations:.1f}%)")
                     print(f"    Results saved to: {output_dir}/raw_results.csv")
-            start_rep = 0
     except KeyboardInterrupt:
         print("\nExperiment interrupted. Progress saved!")
         return pd.DataFrame(results_so_far)
@@ -230,12 +249,12 @@ def run_experiment_2(config=None, output_dir="experiment_2_results", resume=True
     df_results = pd.DataFrame(results_so_far)
     # Standardize column order for output
     preferred_order = [
-        'train_size', 'repetition', 'seed', 'categorical', 'column_order_strategy', 'column_order', 'graph_type', 'graph_structure'
+        'algorithm', 'train_size', 'repetition', 'seed', 'categorical', 'column_order_strategy', 'column_order'
     ]
     metric_cols = [col for col in df_results.columns if col not in preferred_order]
     ordered_cols = [col for col in preferred_order if col in df_results.columns] + metric_cols
     df_results = df_results[ordered_cols]
-    df_results.to_csv(output_dir / "raw_results_final.csv", index=False)
+    df_results.to_csv(output_dir / "experiment_2_results.csv", index=False)
     print(f"Results saved to: {output_dir}")
     print(f"Total results: {len(df_results)}")
     return df_results
@@ -294,7 +313,7 @@ def main():
         print("=" * 60)
         
         # Get actual metric columns from results
-        metric_columns = [col for col in results.columns if col not in ['train_size', 'repetition', 'categorical', 'seed', 'column_order_strategy', 'column_order', 'graph_type', 'graph_structure']]
+        metric_columns = [col for col in results.columns if col not in ['train_size', 'repetition', 'categorical', 'seed', 'column_order_strategy', 'column_order', 'algorithm']]
         
         # Best and worst orderings per metric
         for metric in metric_columns:

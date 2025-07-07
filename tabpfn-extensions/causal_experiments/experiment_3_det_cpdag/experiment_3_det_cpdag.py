@@ -8,6 +8,8 @@ than providing no DAG at all. We compare multiple DAG conditions:
 - wrong_parents: DAG with incorrect parent relationships
 - missing_edges: DAG missing some true edges
 - extra_edges: DAG with spurious edges added
+- disconnected: All nodes independent (no edges, zero causal knowledge)
+- cpdag: CPDAG (Completed Partially Directed Acyclic Graph)
 
 Usage:
     python experiment_3.py                    # Run full experiment
@@ -26,6 +28,7 @@ from io import StringIO
 import warnings
 import argparse
 import hashlib
+from collections import OrderedDict
 
 # Add the causal_experiments directory to the path for local imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -43,14 +46,22 @@ unsupervised = UnsupervisedNamespace()
 # Local imports
 from utils.scm_data import generate_scm_data, get_dag_and_config, get_cpdag_and_config
 from utils.metrics import FaithfulDataEvaluator
-from utils.dag_utils import get_ordering_strategies, reorder_data_and_dag, print_dag_info, create_dag_variations
+from utils.dag_utils import get_ordering_strategies, reorder_data_and_dag, print_dag_info, create_dag_variations, dag_belongs_to_cpdag, get_graph_edge_counts
 from utils.checkpoint_utils import save_checkpoint, get_checkpoint_info, cleanup_checkpoint
 from utils.experiment_utils import generate_synthetic_data_quiet, reorder_data_and_columns
 
 # Centralized default config
 DEFAULT_CONFIG = {
     'train_sizes': [20, 50, 100, 200, 500],
-    'dag_types': ['dag', 'vanilla', 'wrong_parents', 'missing_edges', 'extra_edges', 'cpdag'],
+    'cases': [
+        {'algorithm': 'vanilla', 'graph_type': None},
+        {'algorithm': 'dag', 'graph_type': 'correct'},
+        {'algorithm': 'dag', 'graph_type': 'wrong_parents'},
+        {'algorithm': 'dag', 'graph_type': 'missing_edges'},
+        {'algorithm': 'dag', 'graph_type': 'extra_edges'},
+        {'algorithm': 'dag', 'graph_type': 'disconnected'},
+        {'algorithm': 'cpdag', 'graph_type': 'cpdag'},
+    ],
     'n_repetitions': 10,
     'test_size': 2000,
     'n_permutations': 3,
@@ -58,8 +69,13 @@ DEFAULT_CONFIG = {
     'include_categorical': False,
     'n_estimators': 3,
     'random_seed_base': 42,
-    'no_dag_order_strategy': 'original',
+    'vanilla_order_strategy': 'original',
 }
+
+# Preferred order for result columns
+PREFERRED_ORDER = [
+    'algorithm', 'graph_type', 'graph_structure', 'dag_edges_directed', 'dag_edges_undirected', 'dag_nodes', 'train_size', 'repetition', 'seed', 'categorical', 'column_order_strategy', 'column_order'
+]
 
 SAVE_DATA_SAMPLES = True  # Set to True to save data_samples for debugging
 
@@ -78,9 +94,18 @@ def evaluate_metrics(X_test, X_synth, col_names, categorical_cols, k_for_kmargin
         k_for_kmarginal=k_for_kmarginal
     )
 
+# Helper to build result row in correct order
+def build_result_row(base_info, metrics, preferred_order, metric_cols):
+    row = OrderedDict()
+    for k in preferred_order:
+        row[k] = base_info.get(k, '')
+    for k in metric_cols:
+        row[k] = metrics.get(k, '')
+    return row
+
 # Pipeline: With DAG (no reordering)
 
-def run_with_dag_type(X_train, X_test, dag, col_names, categorical_cols, config, seed, train_size, repetition, dag_type):
+def run_with_dag_type(X_train, X_test, dag, col_names, categorical_cols, config, seed, train_size, repetition, algorithm, graph_type):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     clf = TabPFNClassifier(n_estimators=config['n_estimators'], device=device)
     reg = TabPFNRegressor(n_estimators=config['n_estimators'], device=device)
@@ -89,43 +114,60 @@ def run_with_dag_type(X_train, X_test, dag, col_names, categorical_cols, config,
         model.set_categorical_features(categorical_cols)
     model.fit(torch.from_numpy(X_train).float())
     X_synth = generate_synthetic_data_quiet(
-        model, config['test_size'], dag, config['n_permutations']
+        model, config['test_size'], dag=dag, n_permutations=config['n_permutations']
     )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     metrics = evaluate_metrics(X_test, X_synth, col_names, categorical_cols)
+    # Conversione della struttura del DAG in dizionario leggibile
+    if dag is not None:
+        if isinstance(dag, np.ndarray):
+            dag_dict = model._parse_cpdag_adjacency_matrix(dag)
+        else:
+            dag_dict = dag
+        graph_structure_str = str(dag_dict)
+        edge_counts = get_graph_edge_counts(dag_dict)
+        dag_nodes = len(dag_dict)
+    else:
+        graph_structure_str = ''
+        edge_counts = {'directed': 0, 'undirected': 0}
+        dag_nodes = 0
     base_info = {
         'train_size': train_size,
-        'graph_type': dag_type,
-        'graph_structure': str(dag) if dag is not None else '',
+        'algorithm': algorithm,
+        'graph_type': graph_type,
+        'graph_structure': graph_structure_str,
         'repetition': repetition,
         'seed': seed,
         'categorical': config['include_categorical'],
         'column_order_strategy': '',
         'column_order': '',
+        'dag_edges_directed': edge_counts['directed'],
+        'dag_edges_undirected': edge_counts['undirected'],
+        'dag_nodes': dag_nodes,
+        'dag_structure': str(dag_dict),
     }
-    def flatten_metrics():
-        flat = {}
-        for metric in config['metrics']:
-            value = metrics.get(metric)
-            if isinstance(value, dict):
-                for submetric, subvalue in value.items():
-                    flat[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
-            else:
-                flat[metric] = value if value is not None else ''
-        return flat
-    if dag is not None:
-        base_info['dag_edges'] = sum(len(parents) for parents in dag.values())
-    return {**base_info, **flatten_metrics()}, X_synth
+    # Flatten metrics
+    flat_metrics = {}
+    for metric in config['metrics']:
+        value = metrics.get(metric)
+        if isinstance(value, dict):
+            for submetric, subvalue in value.items():
+                flat_metrics[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
+        else:
+            flat_metrics[metric] = value if value is not None else ''
+    metric_cols = list(flat_metrics.keys())
+    result_row = build_result_row(base_info, flat_metrics, PREFERRED_ORDER, metric_cols)
+    return result_row, X_synth
 
 # Pipeline: No DAG (with reordering)
 
-def run_no_dag(X_train, X_test, col_names, categorical_cols, config, seed, train_size, repetition, dag_type, pre_calculated_column_order, pre_calculated_order_strategy):
+def run_vanilla(X_train, X_test, col_names, categorical_cols, config, seed, train_size, repetition, algorithm, vanilla_column_order, vanilla_order_strategy):
     X_train_reordered, col_names_reordered, categorical_cols_reordered = reorder_data_and_columns(
-        X_train, col_names, categorical_cols, pre_calculated_column_order
+        X_train, col_names, categorical_cols, vanilla_column_order
     )
     X_test_reordered, _, _ = reorder_data_and_columns(
-        X_test, col_names, categorical_cols, pre_calculated_column_order
+        X_test, col_names, categorical_cols, vanilla_column_order
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     clf = TabPFNClassifier(n_estimators=config['n_estimators'], device=device)
@@ -135,36 +177,41 @@ def run_no_dag(X_train, X_test, col_names, categorical_cols, config, seed, train
         model.set_categorical_features(categorical_cols_reordered)
     model.fit(torch.from_numpy(X_train_reordered).float())
     X_synth = generate_synthetic_data_quiet(
-        model, config['test_size'], None, config['n_permutations']
+        model, config['test_size'], n_permutations=config['n_permutations']
     )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     metrics = evaluate_metrics(X_test_reordered, X_synth, col_names_reordered, categorical_cols_reordered)
     base_info = {
         'train_size': train_size,
-        'graph_type': dag_type,
+        'algorithm': algorithm,
+        'graph_type': None,
         'graph_structure': '',
         'repetition': repetition,
         'seed': seed,
         'categorical': config['include_categorical'],
-        'column_order_strategy': pre_calculated_order_strategy,
-        'column_order': str(pre_calculated_column_order),
+        'column_order_strategy': vanilla_order_strategy,
+        'column_order': str(vanilla_column_order),
+        'dag_edges_directed': 0,
+        'dag_edges_undirected': 0,
+        'dag_nodes': 0,
+        'dag_structure': '',
     }
-    def flatten_metrics():
-        flat = {}
-        for metric in config['metrics']:
-            value = metrics.get(metric)
-            if isinstance(value, dict):
-                for submetric, subvalue in value.items():
-                    flat[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
-            else:
-                flat[metric] = value if value is not None else ''
-        return flat
-    base_info['dag_edges'] = 0
-    return {**base_info, **flatten_metrics()}, X_synth, col_names_reordered
+    # Flatten metrics
+    flat_metrics = {}
+    for metric in config['metrics']:
+        value = metrics.get(metric)
+        if isinstance(value, dict):
+            for submetric, subvalue in value.items():
+                flat_metrics[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
+        else:
+            flat_metrics[metric] = value if value is not None else ''
+    metric_cols = list(flat_metrics.keys())
+    result_row = build_result_row(base_info, flat_metrics, PREFERRED_ORDER, metric_cols)
+    return result_row, X_synth, col_names_reordered
 
 # Add run_with_cpdag pipeline (adapted from experiment 1)
-def run_with_cpdag(X_train, X_test, cpdag, col_names, categorical_cols, config, seed, train_size, repetition):
+def run_with_cpdag(X_train, X_test, cpdag, col_names, categorical_cols, config, seed, train_size, repetition, algorithm):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     clf = TabPFNClassifier(n_estimators=config['n_estimators'], device=device)
     reg = TabPFNRegressor(n_estimators=config['n_estimators'], device=device)
@@ -178,35 +225,47 @@ def run_with_cpdag(X_train, X_test, cpdag, col_names, categorical_cols, config, 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     metrics = evaluate_metrics(X_test, X_synth, col_names, categorical_cols)
+    if isinstance(cpdag, np.ndarray):
+        cpdag_dict = model._parse_cpdag_adjacency_matrix(cpdag)
+    else:
+        cpdag_dict = cpdag
+    edge_counts = get_graph_edge_counts(cpdag_dict)
+    dag_nodes = len(cpdag_dict)
     base_info = {
         'train_size': train_size,
+        'algorithm': algorithm,
         'graph_type': 'cpdag',
-        'graph_structure': str(cpdag),
+        'graph_structure': str(cpdag_dict),
         'repetition': repetition,
         'seed': seed,
         'categorical': config['include_categorical'],
         'column_order_strategy': '',
         'column_order': '',
+        'dag_edges_directed': edge_counts['directed'],
+        'dag_edges_undirected': edge_counts['undirected'],
+        'dag_nodes': dag_nodes,
+        'dag_structure': str(cpdag_dict),
     }
-    def flatten_metrics():
-        flat = {}
-        for metric in config['metrics']:
-            value = metrics.get(metric)
-            if isinstance(value, dict):
-                for submetric, subvalue in value.items():
-                    flat[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
-            else:
-                flat[metric] = value if value is not None else ''
-        return flat
-    return {**base_info, **flatten_metrics()}, X_synth
+    # Flatten metrics
+    flat_metrics = {}
+    for metric in config['metrics']:
+        value = metrics.get(metric)
+        if isinstance(value, dict):
+            for submetric, subvalue in value.items():
+                flat_metrics[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
+        else:
+            flat_metrics[metric] = value if value is not None else ''
+    metric_cols = list(flat_metrics.keys())
+    result_row = build_result_row(base_info, flat_metrics, PREFERRED_ORDER, metric_cols)
+    return result_row, X_synth
 
 # Main configuration orchestrator
 
-def run_single_configuration(train_size, dag_type, repetition, config, 
+def run_single_configuration(train_size, algorithm, graph_type, repetition, config, 
                            X_test, col_names, categorical_cols,
-                           dag_variations, cpdag, no_dag_column_order, no_dag_order_strategy,
+                           dag_variations, cpdag, vanilla_column_order, vanilla_order_strategy,
                            data_samples_dir=None, hash_check_dict=None):
-    print(f"    DAG type: {dag_type}, Rep: {repetition+1}/{config['n_repetitions']}")
+    print(f"    Running algorithm: {algorithm}" + (f", graph: {graph_type}" if graph_type else "") + f", Rep: {repetition+1}/{config['n_repetitions']}")
     seed = config['random_seed_base'] + repetition
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -230,32 +289,36 @@ def run_single_configuration(train_size, dag_type, repetition, config,
                 raise RuntimeError(f"[HASH ERROR] Train/Test data hash mismatch for train_size={train_size}, repetition={repetition}!\nPrev train hash: {prev_train_hash}\nCurrent train hash: {train_hash}\nPrev test hash: {prev_test_hash}\nCurrent test hash: {test_hash}")
         else:
             hash_check_dict[key] = (train_hash, test_hash)
-    dag_to_use = dag_variations.get(dag_type)
     result_row, X_synth = None, None
-    if dag_type == 'vanilla':
-        print(f"    Using pre-calculated column order: {no_dag_order_strategy} = {no_dag_column_order}")
-        result_row, X_synth, col_names_reordered = run_no_dag(X_train_original, X_test, col_names, categorical_cols, config, seed, train_size, repetition, dag_type, no_dag_column_order, no_dag_order_strategy)
+    if algorithm == 'vanilla':
+        print(f"    Using pre-calculated column order: {vanilla_order_strategy} = {vanilla_column_order}")
+        result_row, X_synth, col_names_reordered = run_vanilla(X_train_original, X_test, col_names, categorical_cols, config, seed, train_size, repetition, algorithm, vanilla_column_order, vanilla_order_strategy)
         if data_samples_dir and SAVE_DATA_SAMPLES:
-            X_train_reordered, _, _ = reorder_data_and_columns(X_train_original, col_names, categorical_cols, no_dag_column_order)
-            X_test_reordered, _, _ = reorder_data_and_columns(X_test, col_names, categorical_cols, no_dag_column_order)
-            file_prefix = f"dag_{dag_type}_size{train_size}_rep{repetition}"
+            X_train_reordered, _, _ = reorder_data_and_columns(X_train_original, col_names, categorical_cols, vanilla_column_order)
+            X_test_reordered, _, _ = reorder_data_and_columns(X_test, col_names, categorical_cols, vanilla_column_order)
+            file_prefix = f"algorithm_{algorithm}_size{train_size}_rep{repetition}"
             pd.DataFrame(X_train_reordered, columns=col_names_reordered).head(10).to_csv(data_samples_dir / f"{file_prefix}_train.csv", index=False)
             pd.DataFrame(X_test_reordered, columns=col_names_reordered).head(10).to_csv(data_samples_dir / f"{file_prefix}_test.csv", index=False)
             pd.DataFrame(X_synth, columns=col_names_reordered).head(10).to_csv(data_samples_dir / f"{file_prefix}_synth.csv", index=False)
-    elif dag_type == 'cpdag':
-        result_row, X_synth = run_with_cpdag(X_train_original, X_test, cpdag, col_names, categorical_cols, config, seed, train_size, repetition)
+    elif algorithm == 'cpdag':
+        result_row, X_synth = run_with_cpdag(X_train_original, X_test, cpdag, col_names, categorical_cols, config, seed, train_size, repetition, algorithm)
         if data_samples_dir and SAVE_DATA_SAMPLES:
-            file_prefix = f"dag_{dag_type}_size{train_size}_rep{repetition}"
+            file_prefix = f"algorithm_{algorithm}_size{train_size}_rep{repetition}"
+            pd.DataFrame(X_train_original, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_train.csv", index=False)
+            pd.DataFrame(X_test, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_test.csv", index=False)
+            pd.DataFrame(X_synth, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_synth.csv", index=False)
+    elif algorithm == 'dag':
+        dag_to_use = dag_variations.get(graph_type)
+        if dag_to_use is None:
+            raise ValueError(f"Graph type '{graph_type}' not found in dag_variations: {list(dag_variations.keys())}")
+        result_row, X_synth = run_with_dag_type(X_train_original, X_test, dag_to_use, col_names, categorical_cols, config, seed, train_size, repetition, algorithm, graph_type)
+        if data_samples_dir and SAVE_DATA_SAMPLES:
+            file_prefix = f"algorithm_{algorithm}_graph_{graph_type}_size{train_size}_rep{repetition}"
             pd.DataFrame(X_train_original, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_train.csv", index=False)
             pd.DataFrame(X_test, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_test.csv", index=False)
             pd.DataFrame(X_synth, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_synth.csv", index=False)
     else:
-        result_row, X_synth = run_with_dag_type(X_train_original, X_test, dag_to_use, col_names, categorical_cols, config, seed, train_size, repetition, dag_type)
-        if data_samples_dir and SAVE_DATA_SAMPLES:
-            file_prefix = f"dag_{dag_type}_size{train_size}_rep{repetition}"
-            pd.DataFrame(X_train_original, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_train.csv", index=False)
-            pd.DataFrame(X_test, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_test.csv", index=False)
-            pd.DataFrame(X_synth, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_synth.csv", index=False)
+        raise ValueError(f"Unknown algorithm: {algorithm}")
     return result_row
 
 def run_experiment_3(config=None, output_dir="experiment_3_results", resume=True):
@@ -278,7 +341,7 @@ def run_experiment_3(config=None, output_dir="experiment_3_results", resume=True
     X_test_original = generate_scm_data(config['test_size'], 123, config['include_categorical'])
     dag_variations = create_dag_variations(correct_dag)
     available_orderings = get_ordering_strategies(correct_dag)
-    vanilla_order_strategy = config.get('no_dag_order_strategy')
+    vanilla_order_strategy = config.get('vanilla_order_strategy')
     if vanilla_order_strategy not in available_orderings:
         raise ValueError(f"Unknown vanilla_order_strategy: {vanilla_order_strategy}. Available: {list(available_orderings.keys())}")
     vanilla_column_order = available_orderings[vanilla_order_strategy]
@@ -287,17 +350,31 @@ def run_experiment_3(config=None, output_dir="experiment_3_results", resume=True
         results_so_far, start_train_idx, start_rep = get_checkpoint_info(output_dir)
     else:
         results_so_far, start_train_idx, start_rep = [], 0, 0
-    total_iterations = len(config['train_sizes']) * len(config['dag_types']) * config['n_repetitions']
+    total_iterations = len(config['train_sizes']) * len(config['cases']) * config['n_repetitions']
     completed = len(results_so_far)
     print(f"Total iterations: {total_iterations}, Already completed: {completed}")
     try:
         hash_check_dict = {}
-        for dag_type in config['dag_types']:
-            print(f"\n=== Running DAG type: {dag_type} ===")
+        config_idx = 0
+        cases = config['cases']
+        for case in cases:
+            algorithm = case['algorithm']
+            graph_type = case['graph_type']
+            if algorithm == 'vanilla':
+                print(f"\n=== Running algorithm: vanilla ===")
+            elif algorithm == 'cpdag':
+                print(f"\n=== Running algorithm: cpdag ===")
+            elif algorithm == 'dag':
+                print(f"\n=== Running algorithm: dag, graph: {graph_type} ===")
+            else:
+                print(f"\n=== Running algorithm: {algorithm}, graph: {graph_type} ===")
             for train_idx, train_size in enumerate(config['train_sizes']):
                 for rep in range(config['n_repetitions']):
+                    if config_idx < completed:
+                        config_idx += 1
+                        continue
                     result = run_single_configuration(
-                        train_size, dag_type, rep, config, X_test_original,
+                        train_size, algorithm, graph_type, rep, config, X_test_original,
                         col_names, categorical_cols, dag_variations, cpdag, vanilla_column_order, vanilla_order_strategy,
                         data_samples_dir=data_samples_dir, hash_check_dict=hash_check_dict
                     )
@@ -306,7 +383,8 @@ def run_experiment_3(config=None, output_dir="experiment_3_results", resume=True
                     df_current.to_csv(output_dir / "raw_results.csv", index=False)
                     save_checkpoint(results_so_far, train_idx, rep + 1, output_dir)
                     completed += 1
-                    print(f"    Progress ({dag_type}): {completed}/{total_iterations} ({100*completed/total_iterations:.1f}%)")
+                    config_idx += 1
+                    print(f"    Progress ({algorithm}{'/' + str(graph_type) if graph_type else ''}): {completed}/{total_iterations} ({100*completed/total_iterations:.1f}%)")
                     print(f"    Results saved to: {output_dir}/raw_results.csv")
     except KeyboardInterrupt:
         print("\nExperiment interrupted. Progress saved!")
@@ -316,13 +394,12 @@ def run_experiment_3(config=None, output_dir="experiment_3_results", resume=True
     df_results = pd.DataFrame(results_so_far)
     # Standardize column order for output
     preferred_order = [
-        'train_size', 'graph_type', 'graph_structure', 'repetition', 'seed', 'categorical',
-        'column_order_strategy', 'column_order', 'dag_edges'
+        'algorithm', 'graph_type', 'graph_structure', 'dag_edges_directed', 'dag_edges_undirected', 'dag_nodes', 'train_size', 'repetition', 'seed', 'categorical', 'column_order_strategy', 'column_order'
     ]
     metric_cols = [col for col in df_results.columns if col not in preferred_order]
     ordered_cols = [col for col in preferred_order if col in df_results.columns] + metric_cols
     df_results = df_results[ordered_cols]
-    df_results.to_csv(output_dir / "raw_results_final.csv", index=False)
+    df_results.to_csv(output_dir / f"experiment_3_results.csv", index=False, na_rep='')
     print(f"Results saved to: {output_dir}")
     print(f"Total results: {len(df_results)}")
     return df_results
@@ -353,13 +430,15 @@ def main():
     
     # Show DAG variations
     dag_variations = create_dag_variations(dag)
-    print("\n\nDAG variations to test:")
+    print("\n\nAlgorithms/Graphs to test:")
     print("-" * 40)
-    print("1. dag: The true DAG")
-    print("2. vanilla: No DAG provided (vanilla TabPFN)")
-    print("3. wrong_parents: Completely wrong parent relationships")
-    print("4. missing_edges: Some true edges removed")
-    print("5. extra_edges: Spurious edges added")
+    print("1. vanilla: Algorithm (no graph provided, TabPFN vanilla)")
+    print("2. dag (correct): Algorithm (true DAG provided)")
+    print("3. cpdag: Algorithm (CPDAG provided, equivalence class of DAGs)")
+    print("4. wrong_parents: Graph (DAG with wrong parent relationships)")
+    print("5. missing_edges: Graph (DAG with some true edges removed)")
+    print("6. extra_edges: Graph (DAG with spurious edges added)")
+    print("7. disconnected: Graph (all nodes independent, zero causal knowledge)")
     
     # Use centralized config
     print("\n\nRunning FULL experiment...")
@@ -368,12 +447,12 @@ def main():
     
     # Calculate total configurations
     total_configs = (len(config['train_sizes']) * 
-                    len(config['dag_types']) * 
+                    len(config['cases']) * 
                     config['n_repetitions'])
     
     print(f"\nExperiment Configuration:")
     print(f"  Training sizes: {config['train_sizes']}")
-    print(f"  DAG types: {config['dag_types']}")
+    print(f"  Cases: {config['cases']}")
     print(f"  Repetitions: {config['n_repetitions']}")
     print(f"  Total configurations: {total_configs}")
     print(f"  Resume: {not args.no_resume}")
@@ -394,7 +473,7 @@ def main():
         
         # Overall comparison
         # Get actual metric columns from results
-        metric_columns = [col for col in results.columns if col not in ['train_size', 'graph_type', 'graph_structure', 'repetition', 'categorical', 'dag_edges']]
+        metric_columns = [col for col in results.columns if col not in ['train_size', 'graph_type', 'algorithm', 'graph_structure', 'repetition', 'categorical', 'dag_edges_directed', 'dag_edges_undirected', 'dag_nodes']]
         
         for metric in metric_columns:
             # Ensure metric column is numeric for mean calculation
@@ -413,15 +492,15 @@ def main():
                 print(f"  {i}. {dag_type}: {value:.4f}")
             
             # Compare to correct DAG
-            if 'dag' in mean_by_dag.index:
-                correct_value = mean_by_dag['dag']
+            if 'correct' in mean_by_dag.index:
+                correct_value = mean_by_dag['correct']
                 print(f"\nComparison to correct DAG ({correct_value:.4f}):")
                 
-                for dag_type in config['dag_types']:
-                    if dag_type != 'dag' and dag_type in mean_by_dag.index:
-                        diff = mean_by_dag[dag_type] - correct_value
+                for case in config['cases']:
+                    if case['graph_type'] != 'correct' and case['algorithm'] in mean_by_dag.index:
+                        diff = mean_by_dag[case['algorithm']] - correct_value
                         pct_worse = (diff / correct_value) * 100 if correct_value != 0 else float('nan')
-                        print(f"  {dag_type}: {diff:+.4f} ({pct_worse:+.1f}%)")
+                        print(f"  {case['algorithm']}: {diff:+.4f} ({pct_worse:+.1f}%)")
 
 
 if __name__ == "__main__":

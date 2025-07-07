@@ -516,6 +516,17 @@ def create_extra_edges_dag(dag: Dict[int, List[int]], addition_fraction: float =
     return new_dag
 
 
+def create_disconnected_dag(dag: Dict[int, List[int]]) -> Dict[int, List[int]]:
+    """
+    Create a disconnected DAG where all nodes are independent (no edges).
+    The node set is inferred from the input DAG.
+    """
+    all_nodes = set(dag.keys())
+    for parents in dag.values():
+        all_nodes.update(parents)
+    return {node: [] for node in all_nodes}
+
+
 def create_dag_variations(dag: Dict[int, List[int]], random_state: int = 42) -> Dict[str, Dict[int, List[int]]]:
     """
     Create all standard DAG variations for robustness testing.
@@ -534,7 +545,8 @@ def create_dag_variations(dag: Dict[int, List[int]], random_state: int = 42) -> 
         'no_dag': None,
         'wrong_parents': create_wrong_parents_dag(dag, random_state),
         'missing_edges': create_missing_edges_dag(dag, 0.5, random_state),
-        'extra_edges': create_extra_edges_dag(dag, 0.5, random_state)
+        'extra_edges': create_extra_edges_dag(dag, 0.5, random_state),
+        'disconnected': create_disconnected_dag(dag),
     }
     
     return variations
@@ -848,6 +860,34 @@ def test_cpdag_conversion():
     assert len(named_dags) == 2
     
     print("\nSuccessfully verified the generated DAGs (named format).")
+
+
+def count_graph_edges(graph_dict):
+    """
+    Count the number of edges in a DAG or CPDAG dict.
+    For a standard DAG: returns (directed, 0)
+    For a CPDAG dict: returns (directed, undirected)
+    """
+    if not graph_dict:
+        return 0, 0
+    sample_val = next(iter(graph_dict.values()))
+    if isinstance(sample_val, dict) and 'parents' in sample_val:
+        # CPDAG dict
+        directed = sum(len(v.get('parents', [])) for v in graph_dict.values())
+        undirected = sum(len(v.get('undirected', [])) for v in graph_dict.values()) // 2
+        return directed, undirected
+    else:
+        # Standard DAG dict
+        directed = sum(len(parents) for parents in graph_dict.values())
+        return directed, 0
+
+
+def get_graph_edge_counts(graph_dict):
+    """
+    Returns a dict with 'directed' and 'undirected' edge counts for a DAG or CPDAG dict.
+    """
+    directed, undirected = count_graph_edges(graph_dict)
+    return {'directed': directed, 'undirected': undirected}
 
 
 # Example usage and testing

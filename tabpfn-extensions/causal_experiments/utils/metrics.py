@@ -88,10 +88,10 @@ def calculate_propensity_metrics(
 
     Returns:
         Dictionary with the following keys:
-            - 'avg pMSE'
-            - 'pMSE err'
-            - 'avg acc'
-            - 'acc err'
+            - 'avg_pMSE'
+            - 'pMSE_err'
+            - 'avg_acc'
+            - 'acc_err'
         If a metric is missing, its value is -1.0.
     """
     if cat_cols is None:
@@ -116,12 +116,18 @@ def calculate_propensity_metrics(
         # Restore the original savefig function
         plt.savefig = original_savefig
 
-    keys = ['avg pMSE', 'pMSE err', 'avg acc', 'acc err']
+    # Map old keys to new keys with underscores
+    key_map = {
+        'avg_pMSE': 'avg pMSE',
+        'pMSE_err': 'pMSE err',
+        'avg_acc': 'avg acc',
+        'acc_err': 'acc err',
+    }
     try:
         pmse_results = evaluator._raw_results["p_mse"]
-        return {key: pmse_results.get(key, -1.0) for key in keys}
+        return {new_key: pmse_results.get(old_key, -1.0) for new_key, old_key in key_map.items()}
     except Exception:
-        return {key: -1.0 for key in keys}
+        return {new_key: -1.0 for new_key in key_map.keys()}
 
 def _discretize_for_kmarginal(
     real_data: pd.DataFrame,

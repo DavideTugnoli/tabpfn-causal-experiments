@@ -22,6 +22,7 @@ import argparse
 import shutil
 import hashlib
 import json
+from collections import OrderedDict
 
 # Add the causal_experiments directory to the path for local imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -32,13 +33,18 @@ from tabpfn_extensions import TabPFNClassifier, TabPFNRegressor, unsupervised
 # Local imports
 from utils.scm_data import generate_scm_data, get_dag_and_config, get_cpdag_and_config
 from utils.metrics import FaithfulDataEvaluator
-from utils.dag_utils import get_ordering_strategies, reorder_data_and_dag, print_dag_info
+from utils.dag_utils import get_ordering_strategies, reorder_data_and_dag, print_dag_info, create_dag_variations, dag_belongs_to_cpdag, get_graph_edge_counts
 from utils.checkpoint_utils import save_checkpoint, get_checkpoint_info, cleanup_checkpoint
 from utils.experiment_utils import generate_synthetic_data_quiet, reorder_data_and_columns
 
 # Centralized default config
 DEFAULT_CONFIG = {
     'train_sizes': [20, 50, 100, 200, 500],
+    'cases': [
+        {'algorithm': 'vanilla', 'graph_type': None},
+        {'algorithm': 'dag', 'graph_type': 'correct'},
+        {'algorithm': 'cpdag', 'graph_type': 'cpdag'},
+    ],
     'n_repetitions': 10,
     'test_size': 2000,
     'n_permutations': 3,
@@ -48,6 +54,11 @@ DEFAULT_CONFIG = {
     'random_seed_base': 42,
     'column_order_strategy': 'original',
 }
+
+# Preferred order for result columns
+PREFERRED_ORDER = [
+    'algorithm', 'graph_type', 'graph_structure', 'dag_edges_directed', 'dag_edges_undirected', 'dag_nodes', 'train_size', 'repetition', 'seed', 'categorical', 'column_order_strategy', 'column_order'
+]
 
 SAVE_DATA_SAMPLES = True  # Set to True to save data_samples for debugging
 
@@ -66,9 +77,18 @@ def evaluate_metrics(X_test, X_synth, col_names, categorical_cols, k_for_kmargin
         k_for_kmarginal=k_for_kmarginal
     )
 
+# Helper to build result row in correct order
+def build_result_row(base_info, metrics, preferred_order, metric_cols):
+    row = OrderedDict()
+    for k in preferred_order:
+        row[k] = base_info.get(k, '')
+    for k in metric_cols:
+        row[k] = metrics.get(k, '')
+    return row
+
 # Pipeline: With DAG (no reordering)
 
-def run_with_dag(X_train, X_test, dag, col_names, categorical_cols, config, seed, train_size, repetition):
+def run_with_dag(X_train, X_test, dag, col_names, categorical_cols, config, seed, train_size, repetition, algorithm, graph_type):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     clf = TabPFNClassifier(n_estimators=config['n_estimators'], device=device)
     reg = TabPFNRegressor(n_estimators=config['n_estimators'], device=device)
@@ -82,6 +102,9 @@ def run_with_dag(X_train, X_test, dag, col_names, categorical_cols, config, seed
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     metrics = evaluate_metrics(X_test, X_synth, col_names, categorical_cols)
+    dag_dict = dag
+    edge_counts = get_graph_edge_counts(dag_dict)
+    dag_nodes = len(dag_dict)
     base_info = {
         'train_size': train_size,
         'repetition': repetition,
@@ -89,22 +112,30 @@ def run_with_dag(X_train, X_test, dag, col_names, categorical_cols, config, seed
         'categorical': config['include_categorical'],
         'column_order_strategy': '',
         'column_order': '',
+        'algorithm': algorithm,
+        'graph_type': graph_type,
+        'graph_structure': str(dag_dict),
+        'dag_edges_directed': edge_counts['directed'],
+        'dag_edges_undirected': edge_counts['undirected'],
+        'dag_nodes': dag_nodes,
+        'dag_structure': str(dag_dict),
     }
-    def flatten_metrics():
-        flat = {}
-        for metric in config['metrics']:
-            value = metrics.get(metric)
-            if isinstance(value, dict):
-                for submetric, subvalue in value.items():
-                    flat[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
-            else:
-                flat[metric] = value if value is not None else ''
-        return flat
-    return {**base_info, 'graph_type': 'correct_dag', 'graph_structure': str(dag), **flatten_metrics()}, X_synth
+    # Flatten metrics
+    flat_metrics = {}
+    for metric in config['metrics']:
+        value = metrics.get(metric)
+        if isinstance(value, dict):
+            for submetric, subvalue in value.items():
+                flat_metrics[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
+        else:
+            flat_metrics[metric] = value if value is not None else ''
+    metric_cols = list(flat_metrics.keys())
+    result_row = build_result_row(base_info, flat_metrics, PREFERRED_ORDER, metric_cols)
+    return result_row, X_synth
 
 # Pipeline: With CPDAG (no reordering)
 
-def run_with_cpdag(X_train, X_test, cpdag, col_names, categorical_cols, config, seed, train_size, repetition):
+def run_with_cpdag(X_train, X_test, cpdag, col_names, categorical_cols, config, seed, train_size, repetition, algorithm):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     clf = TabPFNClassifier(n_estimators=config['n_estimators'], device=device)
     reg = TabPFNRegressor(n_estimators=config['n_estimators'], device=device)
@@ -118,6 +149,12 @@ def run_with_cpdag(X_train, X_test, cpdag, col_names, categorical_cols, config, 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     metrics = evaluate_metrics(X_test, X_synth, col_names, categorical_cols)
+    if isinstance(cpdag, np.ndarray):
+        cpdag_dict = model._parse_cpdag_adjacency_matrix(cpdag)
+    else:
+        cpdag_dict = cpdag
+    edge_counts = get_graph_edge_counts(cpdag_dict)
+    dag_nodes = len(cpdag_dict)
     base_info = {
         'train_size': train_size,
         'repetition': repetition,
@@ -125,27 +162,30 @@ def run_with_cpdag(X_train, X_test, cpdag, col_names, categorical_cols, config, 
         'categorical': config['include_categorical'],
         'column_order_strategy': '',
         'column_order': '',
+        'algorithm': algorithm,
+        'graph_type': 'cpdag',
+        'graph_structure': str(cpdag_dict),
+        'dag_edges_directed': edge_counts['directed'],
+        'dag_edges_undirected': edge_counts['undirected'],
+        'dag_nodes': dag_nodes,
+        'dag_structure': str(cpdag_dict),
     }
-    # Converti la matrice in dizionario come fa TabPFN
-    if isinstance(cpdag, np.ndarray):
-        cpdag_dict = model._parse_cpdag_adjacency_matrix(cpdag)
-    else:
-        cpdag_dict = cpdag
-    def flatten_metrics():
-        flat = {}
-        for metric in config['metrics']:
-            value = metrics.get(metric)
-            if isinstance(value, dict):
-                for submetric, subvalue in value.items():
-                    flat[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
-            else:
-                flat[metric] = value if value is not None else ''
-        return flat
-    return {**base_info, 'graph_type': 'cpdag', 'graph_structure': str(cpdag_dict), **flatten_metrics()}, X_synth
+    # Flatten metrics
+    flat_metrics = {}
+    for metric in config['metrics']:
+        value = metrics.get(metric)
+        if isinstance(value, dict):
+            for submetric, subvalue in value.items():
+                flat_metrics[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
+        else:
+            flat_metrics[metric] = value if value is not None else ''
+    metric_cols = list(flat_metrics.keys())
+    result_row = build_result_row(base_info, flat_metrics, PREFERRED_ORDER, metric_cols)
+    return result_row, X_synth
 
 # Pipeline: No DAG (with reordering)
 
-def run_no_dag(X_train, X_test, col_names, categorical_cols, column_order, config, seed, train_size, repetition, column_order_name=None):
+def run_vanilla(X_train, X_test, col_names, categorical_cols, column_order, config, seed, train_size, repetition, algorithm, column_order_name=None):
     X_train_reordered, col_names_reordered, categorical_cols_reordered = reorder_data_and_columns(
         X_train, col_names, categorical_cols, column_order
     )
@@ -172,24 +212,32 @@ def run_no_dag(X_train, X_test, col_names, categorical_cols, column_order, confi
         'categorical': config['include_categorical'],
         'column_order_strategy': column_order_name if column_order_name is not None else '',
         'column_order': str(column_order) if column_order is not None else '',
+        'algorithm': algorithm,
+        'graph_type': None,
+        'graph_structure': '',
+        'dag_edges_directed': 0,
+        'dag_edges_undirected': 0,
+        'dag_nodes': 0,
+        'dag_structure': '',
     }
-    def flatten_metrics():
-        flat = {}
-        for metric in config['metrics']:
-            value = metrics.get(metric)
-            if isinstance(value, dict):
-                for submetric, subvalue in value.items():
-                    flat[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
-            else:
-                flat[metric] = value if value is not None else ''
-        return flat
-    return {**base_info, 'graph_type': 'no_graph', 'graph_structure': '', **flatten_metrics()}, X_synth, col_names_reordered
+    # Flatten metrics
+    flat_metrics = {}
+    for metric in config['metrics']:
+        value = metrics.get(metric)
+        if isinstance(value, dict):
+            for submetric, subvalue in value.items():
+                flat_metrics[f'{metric}_{submetric}'] = subvalue if subvalue is not None else ''
+        else:
+            flat_metrics[metric] = value if value is not None else ''
+    metric_cols = list(flat_metrics.keys())
+    result_row = build_result_row(base_info, flat_metrics, PREFERRED_ORDER, metric_cols)
+    return result_row, X_synth, col_names_reordered
 
 # Main iteration orchestrator
 
-def run_single_configuration(train_size, dag_type, repetition, config, 
+def run_single_configuration(train_size, algorithm, graph_type, repetition, config, 
                            X_test, col_names, categorical_cols,
-                           correct_dag, cpdag, no_dag_column_order, no_dag_order_strategy,
+                           correct_dag, cpdag, vanilla_column_order, vanilla_order_name,
                            data_samples_dir=None, hash_check_dict=None):
     seed = config['random_seed_base'] + repetition
     torch.manual_seed(seed)
@@ -216,32 +264,34 @@ def run_single_configuration(train_size, dag_type, repetition, config,
         else:
             hash_check_dict[key] = (train_hash, test_hash)
     result_row, X_synth = None, None
-    if dag_type == 'no_dag':
-        result_row, X_synth, col_names_reordered = run_no_dag(
+    if algorithm == 'vanilla':
+        result_row, X_synth, col_names_reordered = run_vanilla(
             X_train_original, X_test, col_names, categorical_cols,
-            no_dag_column_order, config, seed, train_size, repetition, no_dag_order_strategy
+            vanilla_column_order, config, seed, train_size, repetition, algorithm, vanilla_order_name
         )
         if SAVE_DATA_SAMPLES and data_samples_dir:
-            X_train_reordered, _, _ = reorder_data_and_columns(X_train_original, col_names, categorical_cols, no_dag_column_order)
-            X_test_reordered, _, _ = reorder_data_and_columns(X_test, col_names, categorical_cols, no_dag_column_order)
-            file_prefix = f"dag_{dag_type}_size{train_size}_rep{repetition}"
+            X_train_reordered, _, _ = reorder_data_and_columns(X_train_original, col_names, categorical_cols, vanilla_column_order)
+            X_test_reordered, _, _ = reorder_data_and_columns(X_test, col_names, categorical_cols, vanilla_column_order)
+            file_prefix = f"algorithm_{algorithm}_size{train_size}_rep{repetition}"
             pd.DataFrame(X_train_reordered, columns=col_names_reordered).head(10).to_csv(data_samples_dir / f"{file_prefix}_train.csv", index=False)
             pd.DataFrame(X_test_reordered, columns=col_names_reordered).head(10).to_csv(data_samples_dir / f"{file_prefix}_test.csv", index=False)
             pd.DataFrame(X_synth, columns=col_names_reordered).head(10).to_csv(data_samples_dir / f"{file_prefix}_synth.csv", index=False)
-    elif dag_type == 'with_dag':
-        result_row, X_synth = run_with_dag(X_train_original, X_test, correct_dag, col_names, categorical_cols, config, seed, train_size, repetition)
+    elif algorithm == 'dag':
+        result_row, X_synth = run_with_dag(X_train_original, X_test, correct_dag, col_names, categorical_cols, config, seed, train_size, repetition, algorithm, graph_type)
         if SAVE_DATA_SAMPLES and data_samples_dir:
-            file_prefix = f"dag_{dag_type}_size{train_size}_rep{repetition}"
+            file_prefix = f"algorithm_{algorithm}_graph_{graph_type}_size{train_size}_rep{repetition}"
             pd.DataFrame(X_train_original, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_train.csv", index=False)
             pd.DataFrame(X_test, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_test.csv", index=False)
             pd.DataFrame(X_synth, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_synth.csv", index=False)
-    elif dag_type == 'with_cpdag':
-        result_row, X_synth = run_with_cpdag(X_train_original, X_test, cpdag, col_names, categorical_cols, config, seed, train_size, repetition)
+    elif algorithm == 'cpdag':
+        result_row, X_synth = run_with_cpdag(X_train_original, X_test, cpdag, col_names, categorical_cols, config, seed, train_size, repetition, algorithm)
         if SAVE_DATA_SAMPLES and data_samples_dir:
-            file_prefix = f"dag_{dag_type}_size{train_size}_rep{repetition}"
+            file_prefix = f"algorithm_{algorithm}_size{train_size}_rep{repetition}"
             pd.DataFrame(X_train_original, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_train.csv", index=False)
             pd.DataFrame(X_test, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_test.csv", index=False)
             pd.DataFrame(X_synth, columns=col_names).head(10).to_csv(data_samples_dir / f"{file_prefix}_synth.csv", index=False)
+    else:
+        raise ValueError(f"Unknown algorithm: {algorithm}")
     return result_row
 
 def run_experiment_1(config=None, output_dir="experiment_1_results", resume=True):
@@ -267,61 +317,42 @@ def run_experiment_1(config=None, output_dir="experiment_1_results", resume=True
     if column_order_name not in available_orderings:
         raise ValueError(f"Unknown ordering strategy: {column_order_name}. "
                         f"Available: {list(available_orderings.keys())}")
-    no_dag_column_order = available_orderings[column_order_name]
-    print(f"Pre-calculated column order for no_dag case: {column_order_name} = {no_dag_column_order}")
+    vanilla_column_order = available_orderings[column_order_name]
+    print(f"Pre-calculated column order for vanilla case: {column_order_name} = {vanilla_column_order}")
     strategy = config.get('column_order_strategy')
     suffix = strategy
     raw_results_file = output_dir / f"raw_results_{suffix}.csv"
-    raw_results_final_file = output_dir / f"raw_results_final_{suffix}.csv"
+    raw_results_final_file = output_dir / f"experiment_1_results.csv"
     if resume:
         results_so_far, start_train_idx, start_rep = get_checkpoint_info(output_dir)
     else:
         results_so_far, start_train_idx, start_rep = [], 0, 0
-    total_iterations = len(config['train_sizes']) * config['n_repetitions']
+    total_iterations = len(config['train_sizes']) * config['n_repetitions'] * 3
     completed = len(results_so_far)
     print(f"Total iterations: {total_iterations}, Already completed: {completed}")
     try:
-        # Ciclo SEPARATO per DAG
-        for train_idx, train_size in enumerate(config['train_sizes'][start_train_idx:], start_train_idx):
-            rep_start = start_rep if train_idx == start_train_idx else 0
-            for rep in range(rep_start, config['n_repetitions']):
-                row_with_dag = run_single_configuration(
-                    train_size, 'with_dag', rep, config, X_test_original, col_names, categorical_cols, correct_dag, cpdag, None, None, data_samples_dir=data_samples_dir
-                )
-                results_so_far.append(row_with_dag)
-                df_current = pd.DataFrame(results_so_far)
-                df_current.to_csv(raw_results_file, index=False)
-                save_checkpoint(results_so_far, train_idx, rep + 1, output_dir)
-                completed += 1
-                print(f"    Progress (with DAG): {completed}/{total_iterations*3} ({100*completed/(total_iterations*3):.1f}%)")
-                print(f"    Results saved to: {raw_results_file}")
-            start_rep = 0
-        # Ciclo SEPARATO per NO_DAG
-        for train_idx, train_size in enumerate(config['train_sizes']):
-            for rep in range(config['n_repetitions']):
-                row_without_dag = run_single_configuration(
-                    train_size, 'no_dag', rep, config, X_test_original, col_names, categorical_cols, correct_dag, cpdag, no_dag_column_order, column_order_name, data_samples_dir=data_samples_dir
-                )
-                results_so_far.append(row_without_dag)
-                df_current = pd.DataFrame(results_so_far)
-                df_current.to_csv(raw_results_file, index=False)
-                save_checkpoint(results_so_far, train_idx, rep + 1, output_dir)
-                completed += 1
-                print(f"    Progress (no DAG): {completed}/{total_iterations*3} ({100*completed/(total_iterations*3):.1f}%)")
-                print(f"    Results saved to: {raw_results_file}")
-        # Ciclo SEPARATO per CPDAG
-        for train_idx, train_size in enumerate(config['train_sizes']):
-            for rep in range(config['n_repetitions']):
-                row_with_cpdag = run_single_configuration(
-                    train_size, 'with_cpdag', rep, config, X_test_original, col_names, categorical_cols, correct_dag, cpdag, None, None, data_samples_dir=data_samples_dir
-                )
-                results_so_far.append(row_with_cpdag)
-                df_current = pd.DataFrame(results_so_far)
-                df_current.to_csv(raw_results_file, index=False)
-                save_checkpoint(results_so_far, train_idx, rep + 1, output_dir)
-                completed += 1
-                print(f"    Progress (with CPDAG): {completed}/{total_iterations*3} ({100*completed/(total_iterations*3):.1f}%)")
-                print(f"    Results saved to: {raw_results_file}")
+        config_idx = 0
+        cases = config['cases']
+        for case in cases:
+            algorithm = case['algorithm']
+            graph_type = case['graph_type']
+            print(f"\n=== Running algorithm: {algorithm}{' (graph: ' + str(graph_type) + ')' if graph_type else ''} ===")
+            for train_idx, train_size in enumerate(config['train_sizes']):
+                for rep in range(config['n_repetitions']):
+                    if config_idx < completed:
+                        config_idx += 1
+                        continue
+                    row = run_single_configuration(
+                        train_size, algorithm, graph_type, rep, config, X_test_original, col_names, categorical_cols, correct_dag, cpdag, vanilla_column_order, column_order_name, data_samples_dir=data_samples_dir
+                    )
+                    results_so_far.append(row)
+                    df_current = pd.DataFrame(results_so_far)
+                    df_current.to_csv(raw_results_file, index=False)
+                    save_checkpoint(results_so_far, train_idx, rep + 1, output_dir)
+                    completed += 1
+                    config_idx += 1
+                    print(f"    Progress ({algorithm}{'/' + str(graph_type) if graph_type else ''}): {completed}/{total_iterations} ({100*completed/total_iterations:.1f}%)")
+                    print(f"    Results saved to: {raw_results_file}")
     except KeyboardInterrupt:
         print("\nExperiment interrupted. Progress saved!")
         return pd.DataFrame(results_so_far)
@@ -330,14 +361,12 @@ def run_experiment_1(config=None, output_dir="experiment_1_results", resume=True
     df_results = pd.DataFrame(results_so_far)
     # Standardize column order for output
     preferred_order = [
-        'train_size', 'dag_type', 'graph_type', 'graph_structure', 'repetition', 'seed', 'categorical',
-        'column_order_strategy', 'column_order', 'dag_edges', 'dag_nodes', 'dag_structure'
+        'algorithm', 'graph_type', 'graph_structure', 'dag_edges_directed', 'dag_edges_undirected', 'dag_nodes', 'train_size', 'repetition', 'seed', 'categorical', 'column_order_strategy', 'column_order'
     ]
-    # Add metrics at the end, preserving their order
     metric_cols = [col for col in df_results.columns if col not in preferred_order]
     ordered_cols = [col for col in preferred_order if col in df_results.columns] + metric_cols
     df_results = df_results[ordered_cols]
-    df_results.to_csv(raw_results_final_file, index=False)
+    df_results.to_csv(raw_results_final_file, index=False, na_rep='')
     print(f"Results saved to: {raw_results_final_file}")
     print(f"Total results: {len(df_results)}")
     return df_results
@@ -362,6 +391,11 @@ def main():
     print("\nCPDAG structure (X1 -> X2 <- X3 - X4):")
     print(f"CPDAG adjacency matrix:\n{cpdag}")
     print()
+    print("\nAlgorithms/Graphs to test:")
+    print("-" * 40)
+    print("1. vanilla: Algorithm (no graph provided, TabPFN vanilla)")
+    print("2. dag (correct): Algorithm (true DAG provided)")
+    print("3. cpdag: Algorithm (CPDAG provided, equivalence class of DAGs)")
 
     # Determine which orderings to run
     if args.order is None or args.order == 'both':
@@ -388,14 +422,6 @@ def main():
         )
         all_results.append(results)
     # Combine all results if multiple orderings were run
-    if len(all_results) > 1:
-        combined_results = pd.concat(all_results, ignore_index=True)
-        combined_output_dir = args.output or "experiment_1_combined"
-        combined_output_dir = Path(combined_output_dir)
-        combined_output_dir.mkdir(exist_ok=True)
-        combined_results.to_csv(combined_output_dir / "combined_results.csv", index=False)
-        print(f"\nCombined results saved to: {combined_output_dir}")
-        print(f"Combined results shape: {combined_results.shape}")
     print(f"\nAll experiments completed!")
 
 if __name__ == "__main__":
